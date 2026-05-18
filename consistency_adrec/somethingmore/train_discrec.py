@@ -1,31 +1,25 @@
 """
-Train DiscRec.
+Train DiscRec on preprocessed .pkl datasets (ADRec/DiffuRec format).
 
 Example usage:
-    python train_discrec.py --dataset ml-100k --data_root ./data \
-        --epochs 100 --batch_size 512 --lr 1e-3 --d_model 128 --T 50
-
-For Amazon Beauty or Toys:
-    --dataset amazon_beauty
-    --dataset amazon_toys
+    python train_discrec_pkl.py --pkl_path /path/to/ml-100k.pkl --epochs 100
+    python train_discrec_pkl.py --pkl_path /path/to/amazon_beauty.pkl --epochs 100
 """
 
 import argparse
 import json
-import os
 import random
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from discrec_model import DiscRec
-from discrec_dataset import load_dataset
+from discrec_dataset_pkl import load_pkl_dataset
 from discrec_eval import evaluate, measure_latency
 
 
@@ -38,9 +32,10 @@ def set_seed(seed):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", type=str, default="ml-100k",
-                   choices=["ml-100k", "amazon_beauty", "amazon_toys"])
-    p.add_argument("--data_root", type=str, default="./data")
+    p.add_argument("--pkl_path", type=str, required=True,
+                   help="Path to .pkl file with keys ['train', 'val', 'test']")
+    p.add_argument("--dataset_name", type=str, default=None,
+                   help="Optional name for output directory. Defaults to .pkl stem.")
     p.add_argument("--out_dir", type=str, default="./artifacts_discrec")
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -53,7 +48,7 @@ def parse_args():
     p.add_argument("--num_layers_score", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--max_len", type=int, default=50)
-    p.add_argument("--T", type=int, default=50, help="number of diffusion steps")
+    p.add_argument("--T", type=int, default=50)
 
     # Training
     p.add_argument("--epochs", type=int, default=100)
@@ -61,8 +56,9 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--eval_interval", type=int, default=5)
-    p.add_argument("--patience", type=int, default=10)
+    p.add_argument("--patience", type=int, default=15)
     p.add_argument("--clip_grad", type=float, default=1.0)
+    p.add_argument("--num_workers", type=int, default=0)
 
     # Evaluation
     p.add_argument("--eval_nfe", type=int, nargs="+", default=[1, 2, 4, 8])
@@ -75,26 +71,27 @@ def main():
     set_seed(args.seed)
     device = args.device
 
-    out_dir = Path(args.out_dir) / args.dataset / f"seed{args.seed}"
+    name = args.dataset_name or Path(args.pkl_path).stem
+    out_dir = Path(args.out_dir) / name / f"seed{args.seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save args
     with open(out_dir / "config.json", "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    # Load data
-    print(f"[Setup] Loading dataset {args.dataset}...")
-    train_ds, valid_ds, test_ds, num_items = load_dataset(
-        args.dataset, args.data_root, max_len=args.max_len
+    print(f"[Setup] Loading {args.pkl_path}")
+    train_ds, valid_ds, test_ds, num_items = load_pkl_dataset(
+        args.pkl_path, max_len=args.max_len
     )
-    print(f"[Data] num_items = {num_items}")
-    print(f"[Data] train pairs = {len(train_ds)}, valid users = {len(valid_ds)}, test users = {len(test_ds)}")
 
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        drop_last=True,
+        pin_memory=(device == "cuda"),
     )
 
-    # Build model
     model = DiscRec(
         num_items=num_items,
         d_model=args.d_model,
@@ -108,7 +105,7 @@ def main():
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[Model] DiscRec: {n_params/1e6:.2f}M parameters")
+    print(f"[Model] DiscRec: {n_params/1e6:.2f}M params, num_items={num_items}, T={args.T}")
 
     optimizer = AdamW(
         model.parameters(),
@@ -118,11 +115,9 @@ def main():
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # Training loop with early stopping by val HR@10
     best_val_hr10 = -1.0
     best_epoch = -1
     epochs_without_improvement = 0
-
     history_log = []
 
     for epoch in range(args.epochs):
@@ -149,10 +144,11 @@ def main():
         log_entry = {"epoch": epoch, "train_loss": avg_loss, "time": epoch_time}
         print(f"[Epoch {epoch:3d}] loss={avg_loss:.4f}  time={epoch_time:.1f}s")
 
-        # Evaluate periodically
         if (epoch + 1) % args.eval_interval == 0 or epoch == args.epochs - 1:
-            val_metrics = evaluate(model, valid_ds, k_list=(5, 10, 20),
-                                   batch_size=args.batch_size, device=device, num_steps=1)
+            val_metrics = evaluate(
+                model, valid_ds, k_list=(5, 10, 20),
+                batch_size=args.batch_size, device=device, num_steps=1,
+            )
             print(f"  [Val NFE=1] {val_metrics}")
             log_entry["val"] = val_metrics
 
@@ -171,24 +167,24 @@ def main():
 
         history_log.append(log_entry)
 
-    # Load best and evaluate on test
     model.load_state_dict(torch.load(out_dir / "best.pt", map_location=device))
 
     print(f"\n=== Final Test Evaluation (best epoch={best_epoch}) ===")
     test_results = {}
     for nfe in args.eval_nfe:
-        m = evaluate(model, test_ds, k_list=(5, 10, 20),
-                     batch_size=args.batch_size, device=device, num_steps=nfe)
+        m = evaluate(
+            model, test_ds, k_list=(5, 10, 20),
+            batch_size=args.batch_size, device=device, num_steps=nfe,
+        )
         test_results[f"NFE={nfe}"] = m
         print(f"  NFE={nfe} {m}")
 
-    # Latency
     latency = measure_latency(model, test_ds, batch_size=1, device=device)
     print(f"\n=== Inference Latency: {latency:.4f} ms/sample (NFE=1, batch=1) ===")
 
-    # Save summary
     summary = {
-        "dataset": args.dataset,
+        "dataset": name,
+        "pkl_path": str(args.pkl_path),
         "seed": args.seed,
         "best_epoch": best_epoch,
         "best_val_HR@10": best_val_hr10,
