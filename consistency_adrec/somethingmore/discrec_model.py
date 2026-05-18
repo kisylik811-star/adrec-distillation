@@ -95,25 +95,61 @@ class HistoryEncoder(nn.Module):
         history_emb: (B, L, d)
         padding_mask: (B, L) bool - True where PADDED (ignored)
         Returns: (B, d) - last non-pad position representation
+
+        IMPORTANT: We use LEFT-padding (zeros at the start of the sequence).
+        For causal attention, this means that real tokens at the end attend
+        only to other real tokens (PAD positions are to their left but
+        causal mask blocks attending to the right; the issue is that early
+        PAD positions attend to nothing). We zero out those positions
+        after attention to avoid NaN propagation.
         """
         B, L, d = history_emb.shape
-        positions = torch.arange(L, device=history_emb.device).unsqueeze(0).expand(B, L)
+        device = history_emb.device
+
+        # Add positional embeddings only to non-pad positions
+        positions = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
         x = history_emb + self.pos_emb(positions)
 
+        # Zero out PAD positions in input embeddings (defensive)
+        x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+
+        # Causal mask: position i can attend to positions <= i
         causal = torch.triu(
-            torch.full((L, L), float("-inf"), device=x.device), diagonal=1
+            torch.full((L, L), float("-inf"), device=device), diagonal=1
         )
 
+        # NOTE: We deliberately DO NOT pass key_padding_mask here.
+        # Reason: with left-padding + causal mask, a real token at position i
+        # only attends to positions [0, i]. Some of those may be PAD.
+        # If we pass key_padding_mask, then PAD positions at the very start
+        # have NO valid keys to attend to -> softmax over all -inf -> NaN.
+        # Instead we let those positions attend to PAD embeddings (which
+        # we just zeroed out, so their contribution is small), and we
+        # zero out the PAD positions AGAIN after each block to prevent
+        # NaN propagation.
         for block in self.blocks:
-            x = block(x, attn_mask=causal, key_padding_mask=padding_mask)
+            x = block(x, attn_mask=causal, key_padding_mask=None)
+            # Re-zero PAD positions
+            x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
         x = self.ln_final(x)
+        # Re-zero PAD again after LN (LN of zeros is not zero!)
+        x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
-        # Take last non-pad position per sequence
+        # Take last non-pad position per sequence.
+        # With left-padding, the last position L-1 is always non-pad if user has >=1 item.
         valid = (~padding_mask).long()
-        last_idx = valid.sum(dim=1) - 1
-        last_idx = last_idx.clamp(min=0)
-        out = x[torch.arange(B, device=x.device), last_idx]
+        last_idx = valid.sum(dim=1) - 1  # number of real items - 1
+        # For left-padding: last real position is at index L-1
+        # last_idx counts real items; we want position L-1 if has any real items
+        # Actually with left-padding, real items are at positions [L - num_real, L-1]
+        # The last real position is always L-1 (if num_real >= 1).
+        num_real = (~padding_mask).sum(dim=1)  # (B,)
+        last_pos = (L - 1) * torch.ones(B, dtype=torch.long, device=device)
+        # If a user has 0 real items (shouldn't happen), fall back to 0
+        last_pos = torch.where(num_real > 0, last_pos, torch.zeros_like(last_pos))
+
+        out = x[torch.arange(B, device=device), last_pos]  # (B, d)
         return out
 
 
